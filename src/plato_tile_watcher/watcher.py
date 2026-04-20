@@ -1,147 +1,200 @@
-"""Tile lifecycle monitoring — decay, ghost alerts, health checks, batch operations."""
+"""Tile watcher — monitors tile health with trend detection, alert rules, and sliding window analytics."""
 import time
+import math
 from dataclasses import dataclass, field
-from collections import deque
-from typing import Optional
+from typing import Optional, Callable
+from collections import defaultdict, deque
+from enum import Enum
+
+class HealthStatus(Enum):
+    HEALTHY = "healthy"
+    WATCH = "watch"
+    WARNING = "warning"
+    CRITICAL = "critical"
+    DEAD = "dead"
+
+class AlertSeverity(Enum):
+    INFO = "info"
+    WARNING = "warning"
+    CRITICAL = "critical"
+
+class TrendDirection(Enum):
+    IMPROVING = "improving"
+    STABLE = "stable"
+    DECLINING = "declining"
+    CRASHING = "crashing"
 
 @dataclass
-class WatchEvent:
-    event_type: str
+class HealthRecord:
     tile_id: str
-    message: str
+    health: float
+    confidence: float
     timestamp: float = field(default_factory=time.time)
-    data: dict = field(default_factory=dict)
+    room: str = ""
+
+@dataclass
+class AlertRule:
+    name: str
+    condition: str  # "health_below", "health_declining", "confidence_below", "ghost_imminent"
+    threshold: float
+    severity: AlertSeverity = AlertSeverity.WARNING
+    cooldown: float = 300.0  # seconds between alerts for same rule
+    enabled: bool = True
+
+@dataclass
+class Alert:
+    rule_name: str
+    tile_id: str
+    severity: AlertSeverity
+    message: str
+    value: float
+    threshold: float
+    timestamp: float = field(default_factory=time.time)
+    room: str = ""
 
 @dataclass
 class TileHealth:
     tile_id: str
-    health: float = 1.0
-    decay_rate: float = 0.99
-    watched_at: float = field(default_factory=time.time)
-    last_boost: float = 0.0
-    boost_count: int = 0
-    alert_sent: bool = False
+    current_health: float
+    current_confidence: float
+    status: HealthStatus
+    trend: TrendDirection
+    trend_rate: float  # health change per hour
+    history: deque = field(default_factory=lambda: deque(maxlen=100))
+    last_alert: float = 0.0
+    alerts_triggered: int = 0
 
 class TileWatcher:
-    def __init__(self, default_decay: float = 0.99, ghost_threshold: float = 0.05,
-                 alert_threshold: float = 0.15):
-        self.default_decay = default_decay
-        self.ghost_threshold = ghost_threshold
-        self.alert_threshold = alert_threshold
-        self._tiles: dict[str, TileHealth] = {}
-        self._events: deque = deque(maxlen=1000)
-        self._alerts: list[WatchEvent] = []
-        self._ghosted: list[WatchEvent] = []
-        self._tick_count: int = 0
+    def __init__(self, watch_interval: float = 60.0, history_window: float = 3600.0):
+        self.watch_interval = watch_interval
+        self.history_window = history_window
+        self._health: dict[str, TileHealth] = {}
+        self._rules: list[AlertRule] = []
+        self._alerts: deque = deque(maxlen=500)
+        self._handlers: list[Callable] = []
 
-    def watch(self, tile_id: str, health: float = 1.0, decay_rate: float = 0.0):
-        rate = decay_rate if decay_rate > 0 else self.default_decay
-        self._tiles[tile_id] = TileHealth(tile_id=tile_id, health=health, decay_rate=rate)
-        self._events.append(WatchEvent("watch", tile_id, f"Started watching (decay={rate})"))
+    def watch(self, tile_id: str) -> TileHealth:
+        if tile_id not in self._health:
+            self._health[tile_id] = TileHealth(tile_id=tile_id, current_health=1.0,
+                                                current_confidence=1.0,
+                                                status=HealthStatus.HEALTHY,
+                                                trend=TrendDirection.STABLE)
+        return self._health[tile_id]
 
-    def watch_batch(self, tiles: list[dict]) -> int:
-        count = 0
-        for t in tiles:
-            self.watch(t.get("id", ""), t.get("health", 1.0), t.get("decay_rate", 0.0))
-            count += 1
-        return count
+    def update(self, tile_id: str, health: float, confidence: float, room: str = "") -> list[Alert]:
+        th = self.watch(tile_id)
+        th.current_health = health
+        th.current_confidence = confidence
+        th.history.append(HealthRecord(tile_id, health, confidence, room=room))
+        th.status = self._classify(health)
+        th.trend = self._detect_trend(th)
+        th.trend_rate = self._trend_rate(th)
+        alerts = self._check_rules(tile_id, th, room)
+        for alert in alerts:
+            self._alerts.append(alert)
+            th.alerts_triggered += 1
+            for handler in self._handlers:
+                try: handler(alert)
+                except: pass
+        return alerts
 
-    def unwatch(self, tile_id: str) -> bool:
-        removed = self._tiles.pop(tile_id, None)
-        if removed:
-            self._events.append(WatchEvent("unwatch", tile_id, "Stopped watching"))
-            return True
-        return False
+    def add_rule(self, rule: AlertRule):
+        self._rules.append(rule)
 
-    def unwatch_batch(self, tile_ids: list[str]) -> int:
-        return sum(1 for tid in tile_ids if self.unwatch(tid))
+    def on_alert(self, handler: Callable):
+        self._handlers.append(handler)
 
-    def tick(self) -> list[WatchEvent]:
-        events = []
-        self._tick_count += 1
-        to_ghost = []
+    def get_health(self, tile_id: str) -> Optional[TileHealth]:
+        return self._health.get(tile_id)
 
-        for tid, th in self._tiles.items():
-            old_health = th.health
-            th.health *= th.decay_rate
+    def by_status(self, status: HealthStatus) -> list[TileHealth]:
+        return [th for th in self._health.values() if th.status == status]
 
-            # Alert threshold crossed
-            if th.health < self.alert_threshold and not th.alert_sent and old_health >= self.alert_threshold:
-                evt = WatchEvent("alert", tid,
-                               f"Health dropped to {th.health:.4f} (threshold: {self.alert_threshold})",
-                               data={"old_health": old_health, "new_health": th.health})
-                self._events.append(evt)
-                self._alerts.append(evt)
-                th.alert_sent = True
-                events.append(evt)
+    def by_room(self, room: str) -> list[TileHealth]:
+        return [th for th in self._health.values()
+                if th.history and th.history[-1].room == room]
 
-            # Ghost threshold crossed
-            if th.health < self.ghost_threshold:
-                evt = WatchEvent("ghost", tid,
-                               f"Ghosted at {th.health:.5f} (after {self._tick_count} ticks)",
-                               data={"final_health": th.health, "ticks": self._tick_count})
-                self._events.append(evt)
-                self._ghosted.append(evt)
-                to_ghost.append(tid)
-                events.append(evt)
+    def critical_tiles(self) -> list[TileHealth]:
+        return [th for th in self._health.values()
+                if th.status in (HealthStatus.CRITICAL, HealthStatus.DEAD)]
 
-        for tid in to_ghost:
-            self._tiles.pop(tid, None)
+    def alerts(self, severity: str = "", limit: int = 50) -> list[Alert]:
+        alerts = list(self._alerts)
+        if severity:
+            alerts = [a for a in alerts if a.severity.value == severity]
+        return alerts[-limit:]
 
-        return events
+    def dashboard(self) -> dict:
+        statuses = defaultdict(int)
+        trends = defaultdict(int)
+        for th in self._health.values():
+            statuses[th.status.value] += 1
+            trends[th.trend.value] += 1
+        return {"watched": len(self._health), "statuses": dict(statuses),
+                "trends": dict(trends), "rules": len(self._rules),
+                "recent_alerts": len(self._alerts),
+                "critical": len(self.critical_tiles())}
 
-    def boost(self, tile_id: str, amount: float = 0.3) -> bool:
-        th = self._tiles.get(tile_id)
-        if not th:
-            return False
-        th.health = min(1.0, th.health + amount)
-        th.last_boost = time.time()
-        th.boost_count += 1
-        th.alert_sent = False  # Reset alert after boost
-        self._events.append(WatchEvent("boost", tile_id,
-                                      f"Boosted by {amount} to {th.health:.4f} (boost #{th.boost_count})",
-                                      data={"amount": amount, "new_health": th.health}))
-        return True
+    def _classify(self, health: float) -> HealthStatus:
+        if health >= 0.7: return HealthStatus.HEALTHY
+        if health >= 0.4: return HealthStatus.WATCH
+        if health >= 0.2: return HealthStatus.WARNING
+        if health >= 0.05: return HealthStatus.CRITICAL
+        return HealthStatus.DEAD
 
-    def boost_batch(self, tile_ids: list[str], amount: float = 0.3) -> int:
-        return sum(1 for tid in tile_ids if self.boost(tid, amount))
+    def _detect_trend(self, th: TileHealth) -> TrendDirection:
+        history = list(th.history)
+        if len(history) < 3:
+            return TrendDirection.STABLE
+        recent = history[-3:]
+        diff = recent[-1].health - recent[0].health
+        if diff > 0.1: return TrendDirection.IMPROVING
+        if diff < -0.1: return TrendDirection.DECLINING
+        if diff < -0.3: return TrendDirection.CRASHING
+        return TrendDirection.STABLE
 
-    def health_of(self, tile_id: str) -> float:
-        return self._tiles[tile_id].health if tile_id in self._tiles else 0.0
+    def _trend_rate(self, th: TileHealth) -> float:
+        history = list(th.history)
+        if len(history) < 2:
+            return 0.0
+        duration = history[-1].timestamp - history[0].timestamp
+        if duration <= 0:
+            return 0.0
+        health_change = history[-1].health - history[0].health
+        return health_change / (duration / 3600)  # per hour
 
-    def health_report(self) -> list[dict]:
-        report = []
-        for tid, th in self._tiles.items():
-            status = "healthy" if th.health >= self.alert_threshold else ("warning" if th.health >= self.ghost_threshold else "critical")
-            report.append({"tile_id": tid, "health": round(th.health, 4),
-                          "decay_rate": th.decay_rate, "status": status,
-                          "boost_count": th.boost_count,
-                          "age_s": round(time.time() - th.watched_at)})
-        report.sort(key=lambda x: x["health"])
-        return report
-
-    def set_decay(self, tile_id: str, rate: float) -> bool:
-        th = self._tiles.get(tile_id)
-        if th:
-            th.decay_rate = rate
-            return True
-        return False
-
-    @property
-    def active_tiles(self) -> int:
-        return len(self._tiles)
-
-    @property
-    def recent_events(self, n: int = 10) -> list[WatchEvent]:
-        return list(self._events)[-n:]
+    def _check_rules(self, tile_id: str, th: TileHealth, room: str) -> list[Alert]:
+        alerts = []
+        now = time.time()
+        for rule in self._rules:
+            if not rule.enabled:
+                continue
+            if now - th.last_alert < rule.cooldown:
+                continue
+            triggered = False
+            message = ""
+            value = th.current_health
+            if rule.condition == "health_below" and th.current_health < rule.threshold:
+                triggered = True
+                message = f"Health {th.current_health:.2f} below threshold {rule.threshold}"
+            elif rule.condition == "confidence_below" and th.current_confidence < rule.threshold:
+                triggered = True
+                value = th.current_confidence
+                message = f"Confidence {th.current_confidence:.2f} below threshold {rule.threshold}"
+            elif rule.condition == "health_declining" and th.trend_rate < -rule.threshold:
+                triggered = True
+                value = th.trend_rate
+                message = f"Health declining at {th.trend_rate:.3f}/hr"
+            elif rule.condition == "ghost_imminent" and th.current_health < rule.threshold:
+                triggered = True
+                message = f"Ghost imminent: health {th.current_health:.2f}"
+            if triggered:
+                alerts.append(Alert(rule_name=rule.name, tile_id=tile_id,
+                                   severity=rule.severity, message=message,
+                                   value=value, threshold=rule.threshold, room=room))
+                th.last_alert = now
+        return alerts
 
     @property
     def stats(self) -> dict:
-        health_ranges = {"healthy": 0, "warning": 0, "critical": 0}
-        for th in self._tiles.values():
-            if th.health >= self.alert_threshold: health_ranges["healthy"] += 1
-            elif th.health >= self.ghost_threshold: health_ranges["warning"] += 1
-            else: health_ranges["critical"] += 1
-        return {"watching": len(self._tiles), "events": len(self._events),
-                "alerts": len(self._alerts), "ghosted": len(self._ghosted),
-                "ticks": self._tick_count, "health_distribution": health_ranges}
+        return self.dashboard()
